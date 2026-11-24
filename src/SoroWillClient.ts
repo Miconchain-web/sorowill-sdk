@@ -102,6 +102,7 @@ import { HookManager } from './hooks';
 import type { BeforeInvokeContext, AfterInvokeContext } from './hooks';
 import { assertPreparedTransactionMatchesIntendedOperation, assertSupportedSignatureAlgorithm } from './txValidation';
 import { DebugLogger, type DebugLoggerOptions } from './debugLogger';
+import { SoroWillEventEmitter, type SoroWillLifecycleEvent } from './lifecycleEvents';
 
 /** @internal Local alias for Soroban's `xdr.ScVal`; not part of the public API. */
 type ScVal = xdr.ScVal;
@@ -561,6 +562,13 @@ export interface SoroWillClientOptions {
    * ```
    */
   readOnly?: boolean;
+  /**
+   * Optional lifecycle event emitter. When provided, the client emits
+   * `init`, `connect`, `disconnect`, and `error` events to its listeners
+   * (#786). A private emitter is created when omitted, so
+   * {@link SoroWillClient.on} always works.
+   */
+  events?: SoroWillEventEmitter;
 }
 
 /** The raw, snake_case shape of a `Will` as decoded straight off the contract spec. */
@@ -1265,6 +1273,7 @@ export class SoroWillClient {
   private expectedContractVersion?: string | undefined;
   private warnedSpecVersions: Set<string> = new Set();
   private requireWalletNetwork: boolean = false;
+  private readonly lifecycleEvents: SoroWillEventEmitter;
 
   constructor(options: SoroWillClientOptions) {
     // Validate contract ID format on initialization (#626).
@@ -1304,6 +1313,7 @@ export class SoroWillClient {
         } as WalletAdapter)
       : (options.wallet ?? getDefaultWalletAdapter());
     this.requireWalletNetwork = options.requireWalletNetwork ?? false;
+    this.lifecycleEvents = options.events ?? new SoroWillEventEmitter();
     this.pollAttempts = options.pollAttempts ?? DEFAULT_POLL_ATTEMPTS;
     if (!Number.isInteger(this.pollAttempts) || this.pollAttempts <= 0) {
       throw new RangeError('pollAttempts must be a positive integer');
@@ -1419,6 +1429,49 @@ export class SoroWillClient {
         throw err;
       }
     }
+
+    this.lifecycleEvents.emit('init', {
+      network: this.network,
+      contractId: options.contractId,
+      readOnly: this.readOnly,
+    });
+  }
+
+  // -----------------------------------------------------------------------
+  // Lifecycle events (#786)
+  // -----------------------------------------------------------------------
+
+  /**
+   * Registers a listener for SDK lifecycle events (`init`, `connect`,
+   * `disconnect`, `error`). Pass `'*'` to receive every event.
+   *
+   * @returns An unsubscribe function.
+   *
+   * @example
+   * ```ts
+   * const off = client.on('error', (event) => console.warn(event.type, event.error));
+   * // later
+   * off();
+   * ```
+   */
+  on(
+    type: SoroWillLifecycleEvent | '*',
+    listener: (event: SoroWillLifecycleEvent) => void,
+  ): () => void {
+    return this.lifecycleEvents.on(type, listener);
+  }
+
+  /** Removes a previously registered lifecycle listener. */
+  off(type: SoroWillLifecycleEvent | '*', listener: (event: SoroWillLifecycleEvent) => void): void {
+    this.lifecycleEvents.off(type, listener);
+  }
+
+  /** Registers a listener that fires at most once for the given event type. */
+  once(
+    type: SoroWillLifecycleEvent | '*',
+    listener: (event: SoroWillLifecycleEvent) => void,
+  ): () => void {
+    return this.lifecycleEvents.once(type, listener);
   }
 
   // -----------------------------------------------------------------------
@@ -4686,9 +4739,59 @@ export class SoroWillClient {
     if (this.readOnly) {
       throw new ReadOnlyModeError('reconnect');
     }
-    const connection = await this.wallet.reconnect();
-    await this.recoverStateAfterReconnect(connection);
-    return connection;
+    try {
+      const connection = await this.wallet.reconnect();
+      await this.recoverStateAfterReconnect(connection);
+      this.lifecycleEvents.emit('connect', {
+        publicKey: connection.publicKey,
+        network: connection.network,
+        networkPassphrase: connection.networkPassphrase,
+        reconnect: true,
+      });
+      return connection;
+    } catch (error) {
+      this.lifecycleEvents.emit('error', { operation: 'reconnect', error });
+      throw error;
+    }
+  }
+
+  /**
+   * Connects the underlying wallet adapter and emits a `connect` lifecycle
+   * event on success (or an `error` event on failure).
+   *
+   * @throws {ReadOnlyModeError} When the client was constructed with `readOnly: true`.
+   */
+  async connect(): Promise<WalletConnection> {
+    if (this.readOnly) {
+      throw new ReadOnlyModeError('connect');
+    }
+    try {
+      const connection = await this.wallet.connect();
+      this.lifecycleEvents.emit('connect', {
+        publicKey: connection.publicKey,
+        network: connection.network,
+        networkPassphrase: connection.networkPassphrase,
+        reconnect: false,
+      });
+      return connection;
+    } catch (error) {
+      this.lifecycleEvents.emit('error', { operation: 'connect', error });
+      throw error;
+    }
+  }
+
+  /**
+   * Disconnects the underlying wallet adapter (when supported) and emits a
+   * `disconnect` lifecycle event.
+   */
+  async disconnect(): Promise<void> {
+    try {
+      await this.wallet.disconnect();
+      this.lifecycleEvents.emit('disconnect', {});
+    } catch (error) {
+      this.lifecycleEvents.emit('error', { operation: 'disconnect', error });
+      throw error;
+    }
   }
 
   /**
