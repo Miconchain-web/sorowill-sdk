@@ -1881,6 +1881,139 @@ export class SoroWillClient {
    * console.log(`Will triggered in transaction: ${txHash}`);
    * ```
    */
+  /**
+   * Cancels an unconfirmed (still pending) transaction by replacing it with a
+   * high-fee transaction that reuses the same source account and sequence
+   * number (#788).
+   *
+   * **Operation Type:** Write (State-changing)
+   *
+   * @remarks Stellar has no "cancel" operation: a pending transaction is
+   * cancelled by submitting a replacement with the same sequence number and a
+   * fee at least 10x higher (the multiplier stellar-core requires). The
+   * replacement carries a single `manage_data` operation with an empty value,
+   * which is cheap and has no effect on the SoroWill contract, so the original
+   * invocation can never be applied once the replacement is included.
+   *
+   * The replacement is built from the pending transaction's own sequence
+   * number, so it is only valid while the original is still unconfirmed. If
+   * the original has already been included in the ledger, a
+   * {@link SoroWillError} is thrown instead of submitting a no-op.
+   *
+   * @param pendingTxHash - Hash of the unconfirmed transaction to cancel.
+   * @param options - Optional per-call timeout and abort signal.
+   * @returns The replacement transaction hash.
+   * @throws {SoroWillError} If the pending transaction is already confirmed or
+   *   the replacement could not be submitted.
+   * @throws {RequestTimeoutError} If the RPC request exceeds its configured timeout.
+   * @throws {Error} If the wallet is not connected or fails to sign.
+   *
+   * @example
+   * ```ts
+   * const { txHash } = await client.cancelPendingTransaction('abc123hash');
+   * console.log(`Pending transaction replaced by: ${txHash}`);
+   * ```
+   */
+  async cancelPendingTransaction(
+    pendingTxHash: string,
+    options?: RequestOptions,
+  ): Promise<{ txHash: string }> {
+    if (this.readOnly) {
+      throw new ReadOnlyModeError('cancelPendingTransaction');
+    }
+    if (typeof pendingTxHash !== 'string' || pendingTxHash.trim() === '') {
+      throw new SoroWillError(
+        'Cannot cancel a pending transaction: a non-empty transaction hash is required.',
+      );
+    }
+    const hash = pendingTxHash.trim();
+    await this.assertWalletNetwork({ networkPassphrase: this.networkPassphrase });
+
+    // Refuse to "cancel" a transaction that already reached the ledger: its
+    // sequence number is consumed, so a replacement would be rejected.
+    const existing = await this.rpc(
+      () => this.rpcPool.withFailover((server) => server.getTransaction(hash)),
+      options,
+      'cancelPendingTransaction:getTransaction',
+    );
+    if (existing.status === rpc.Api.GetTransactionStatus.SUCCESS) {
+      throw new SoroWillError(
+        'Cannot cancel a pending transaction: it has already been confirmed on-chain.',
+      );
+    }
+
+    const publicKey = await this.getWalletPublicKey();
+    const account = await this.rpc(
+      () => this.rpcPool.withFailover((server) => server.getAccount(publicKey)),
+      options,
+      'cancelPendingTransaction:getAccount',
+    );
+
+    // The replacement must reuse the pending transaction's sequence number to
+    // supersede it. The pending tx used `account.sequence + 1`; the account's
+    // current sequence is that value once the original was accepted into the
+    // mempool, so build from one below it.
+    const replacementSequence = (BigInt(account.sequence) - 1n).toString();
+    const source = new Account(publicKey, replacementSequence);
+    const baseFee = BigInt(BASE_FEE);
+    const replacementFee = (await this.computeBumpedFee(baseFee, options)).toString();
+
+    const builder = new TransactionBuilder(source, {
+      fee: replacementFee,
+      networkPassphrase: this.networkPassphrase,
+    });
+    // A `manage_data` operation with an empty value is cheap and has no effect
+    // on the SoroWill contract, so the replacement only consumes the pending
+    // transaction's sequence number.
+    builder.addOperation(
+      stellarContract.Operation.manageData({
+        name: 'sorowill-cancel',
+        value: '',
+      }),
+    );
+
+    const builtTx = builder.setTimeout(this.transactionTimeoutSeconds).build();
+    this.assertTransactionNetwork(builtTx);
+
+    const prepared = await this.rpc(
+      () => this.rpcPool.withFailover((server) => server.prepareTransaction(builtTx)),
+      options,
+      'cancelPendingTransaction:prepareTransaction',
+    );
+    this.assertTransactionNetwork(prepared);
+
+    const signedResponse = await this.wallet.signTransaction(prepared.toXDR(), {
+      networkPassphrase: this.networkPassphrase,
+    });
+    const signedXdr = normalizeSignatureResponse(signedResponse);
+    const signedTx = TransactionBuilder.fromXDR(signedXdr, this.networkPassphrase);
+    if (!(signedTx instanceof Transaction)) {
+      throw new SoroWillError(
+        'Expected a plain Transaction envelope after signing the cancellation, but received FeeBumpTransaction',
+      );
+    }
+
+    const sendResponse = await this.rpc(
+      () => this.rpcPool.withFailover((server) => server.sendTransaction(signedTx)),
+      options,
+      'cancelPendingTransaction:sendTransaction',
+    );
+    if (sendResponse.status === 'ERROR') {
+      throw new SoroWillError(
+        'Failed to submit the replacement transaction that cancels the pending transaction. ' +
+          'The pending transaction may have already been confirmed; check its status before retrying.',
+      );
+    }
+    if (sendResponse.status === 'TRY_AGAIN_LATER') {
+      throw new SoroWillError(
+        'SoroWill RPC node is under backpressure — the cancellation transaction could not be submitted. Retry later.',
+      );
+    }
+
+    this.debugLogger.logSubmission('cancelPendingTransaction', undefined, sendResponse.hash);
+    return { txHash: sendResponse.hash };
+  }
+
   async triggerWill(willId: string, options?: RequestOptions): Promise<{ txHash: string }> {
     parseWillId(willId);
     await this.assertWalletNetwork({ networkPassphrase: this.networkPassphrase });
