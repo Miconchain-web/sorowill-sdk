@@ -1105,6 +1105,86 @@ function assertBatchSize(length: number, method: string): void {
   }
 }
 
+/** A single beneficiary's previewed share of a will's distribution. */
+export interface BeneficiaryDistributionPreview {
+  /** The beneficiary's Stellar address. */
+  address: string;
+  /** The beneficiary's share, in percent (0-100), as stored on the will. */
+  percentage: number;
+  /** The beneficiary's final amount, in the token's smallest unit (stroops). */
+  amount: bigint;
+}
+
+/** Result of {@link SoroWillClient.previewDistribution}. */
+export interface DistributionPreview {
+  /** Total amount being distributed, in the token's smallest unit (stroops). */
+  totalAmount: bigint;
+  /** Per-beneficiary amounts, in the same order as the will's beneficiaries. */
+  distributions: BeneficiaryDistributionPreview[];
+  /** Sum of all previewed amounts; equals `totalAmount` (rounding remainder is assigned). */
+  distributedAmount: bigint;
+}
+
+/**
+ * Split `totalAmount` across beneficiaries by percentage, in integer units.
+ *
+ * Uses largest-remainder rounding so the parts always sum exactly to
+ * `totalAmount`: each share is floored, then the leftover units are handed out
+ * one at a time to the beneficiaries with the largest fractional remainders
+ * (ties broken by original order). Percentages are converted to basis points
+ * (×100) to match the on-chain representation.
+ */
+export function computeDistributionPreview(
+  totalAmount: bigint,
+  beneficiaries: ReadonlyArray<{ address: string; percentage: number }>,
+): DistributionPreview {
+  if (totalAmount < 0n) {
+    throw new RangeError('totalAmount must be non-negative');
+  }
+  const total = BigInt(totalAmount);
+  const basisPoints = beneficiaries.map((b) => BigInt(Math.round(b.percentage * 100)));
+  const totalBasisPoints = basisPoints.reduce((sum, bp) => sum + bp, 0n);
+
+  const amounts: bigint[] = [];
+  const remainders: { index: number; remainder: bigint }[] = [];
+  let distributed = 0n;
+
+  for (let i = 0; i < beneficiaries.length; i += 1) {
+    const bp = basisPoints[i] ?? 0n;
+    const numerator = total * bp;
+    const share = totalBasisPoints === 0n ? 0n : numerator / totalBasisPoints;
+    amounts.push(share);
+    distributed += share;
+    remainders.push({
+      index: i,
+      remainder: totalBasisPoints === 0n ? 0n : numerator % totalBasisPoints,
+    });
+  }
+
+  let leftover = total - distributed;
+  if (leftover > 0n) {
+    remainders.sort((a, b) => {
+      if (a.remainder === b.remainder) return a.index - b.index;
+      return a.remainder > b.remainder ? -1 : 1;
+    });
+    for (const { index } of remainders) {
+      if (leftover === 0n) break;
+      amounts[index] = (amounts[index] ?? 0n) + 1n;
+      leftover -= 1n;
+    }
+  }
+
+  return {
+    totalAmount: total,
+    distributions: beneficiaries.map((b, i) => ({
+      address: b.address,
+      percentage: b.percentage,
+      amount: amounts[i] ?? 0n,
+    })),
+    distributedAmount: amounts.reduce((sum, amount) => sum + amount, 0n),
+  };
+}
+
 export class SoroWillClient {
   private readonly server: SoroWillRpcServer;
   private readonly rpcPool: RpcEndpointPool;
