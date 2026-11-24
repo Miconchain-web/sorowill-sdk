@@ -51,8 +51,9 @@ import type {
   SorobanEventType,
   UpdateBeneficiariesParams,
   Will,
+  WillStreamOptions,
 } from './types';
-import { WillStatus } from './types';
+import { DEFAULT_WILL_STREAM_CHUNK_SIZE, WillStatus } from './types';
 import {
   assertWalletSessionActive,
   getDefaultWalletAdapter,
@@ -679,6 +680,34 @@ function cloneWill(will: Will): Will {
     lastCheckin: new Date(will.lastCheckin.getTime()),
     triggerTime: will.triggerTime === null ? null : new Date(will.triggerTime.getTime()),
   };
+}
+
+/**
+ * Validates the `chunkSize` option of the streaming list methods (#787).
+ * Falls back to {@link DEFAULT_WILL_STREAM_CHUNK_SIZE} when omitted.
+ */
+function normalizeStreamChunkSize(chunkSize: number | undefined): number {
+  if (chunkSize === undefined) {
+    return DEFAULT_WILL_STREAM_CHUNK_SIZE;
+  }
+  if (!Number.isInteger(chunkSize) || chunkSize <= 0) {
+    throw new InvalidPaginationOptionsError('chunkSize', chunkSize);
+  }
+  return chunkSize;
+}
+
+/**
+ * Validates the `limit` option of the streaming list methods (#787).
+ * Returns `undefined` when no limit was requested.
+ */
+function normalizeStreamLimit(limit: number | undefined): number | undefined {
+  if (limit === undefined) {
+    return undefined;
+  }
+  if (!Number.isInteger(limit) || limit < 0) {
+    throw new InvalidPaginationOptionsError('limit', limit);
+  }
+  return limit;
 }
 
 function mapWillList(raw: unknown): Will[] {
@@ -2761,6 +2790,123 @@ export class SoroWillClient {
       this.deepFreeze ? cloned.map(deepFreezeObject) : cloned,
       options,
     );
+  }
+
+  /**
+   * Streams every will owned by `owner`, one will at a time, instead of
+   * buffering the whole response in memory (#787).
+   *
+   * Results are fetched in pages of {@link WillStreamOptions.chunkSize} wills
+   * (default {@link DEFAULT_WILL_STREAM_CHUNK_SIZE}) and yielded as an async
+   * iterable, so only one page is held in memory at a time. Yields are
+   * de-duplicated by will ID and sorted ascending by `will_id`, matching
+   * {@link getWillsByOwner}.
+   *
+   * **Read-only operation** — does not require wallet authentication.
+   *
+   * @param owner - The Stellar public key of the will owner.
+   * @param options - Optional chunk size, limit, timeout and abort signal.
+   * @returns An async iterable of will records.
+   *
+   * @example
+   * ```ts
+   * for await (const will of client.streamWillsByOwner('GISSUE559...')) {
+   *   process(will);
+   * }
+   * ```
+   */
+  streamWillsByOwner(owner: string, options?: WillStreamOptions): AsyncGenerator<Will, void, undefined> {
+    assertValidStellarAddress(owner, 'owner', { allowContract: true });
+    return this.streamWillsFromPages(
+      (pageOptions) => this.getWillsByOwner(owner, pageOptions),
+      options,
+    );
+  }
+
+  /**
+   * Streams every will `beneficiary` is named in, one will at a time, instead
+   * of buffering the whole response in memory (#787).
+   *
+   * **Read-only operation** — does not require wallet authentication.
+   *
+   * @param beneficiary - The Stellar public key of the beneficiary.
+   * @param options - Optional chunk size, limit, timeout and abort signal.
+   * @returns An async iterable of will records.
+   */
+  streamWillsByBeneficiary(
+    beneficiary: string,
+    options?: WillStreamOptions,
+  ): AsyncGenerator<Will, void, undefined> {
+    assertValidStellarAddress(beneficiary, 'beneficiary', { allowContract: true });
+    return this.streamWillsFromPages(
+      (pageOptions) => this.getWillsByBeneficiary(beneficiary, pageOptions),
+      options,
+    );
+  }
+
+  /**
+   * Streams the wills for `willIds`, one will at a time, instead of buffering
+   * the whole response in memory (#787). IDs are fetched in chunks of
+   * {@link WillStreamOptions.chunkSize} and yielded in input order, repeating
+   * results for duplicate input IDs (matching {@link getWills}).
+   *
+   * @param willIds - Array of will ID strings to fetch.
+   * @param options - Optional chunk size, limit, timeout and abort signal.
+   * @returns An async iterable of will records.
+   */
+  async *streamWills(
+    willIds: string[],
+    options?: WillStreamOptions,
+  ): AsyncGenerator<Will, void, undefined> {
+    const chunkSize = normalizeStreamChunkSize(options?.chunkSize);
+    const limit = normalizeStreamLimit(options?.limit);
+    let yielded = 0;
+    for (let start = 0; start < willIds.length; start += chunkSize) {
+      if (limit !== undefined && yielded >= limit) {
+        return;
+      }
+      const chunk = willIds.slice(start, start + chunkSize);
+      const wills = await this.getWills(chunk, options);
+      for (const will of wills) {
+        if (limit !== undefined && yielded >= limit) {
+          return;
+        }
+        yielded += 1;
+        yield will;
+      }
+    }
+  }
+
+  /**
+   * Shared paging loop behind {@link streamWillsByOwner} and
+   * {@link streamWillsByBeneficiary}: pulls one page at a time and yields its
+   * wills, so peak memory is bounded by `chunkSize` rather than the full
+   * result set (#787).
+   */
+  private async *streamWillsFromPages(
+    fetchPage: (options: PaginationOptions & RequestOptions) => Promise<Will[] | PaginatedWillsResult>,
+    options?: WillStreamOptions,
+  ): AsyncGenerator<Will, void, undefined> {
+    const chunkSize = normalizeStreamChunkSize(options?.chunkSize);
+    const limit = normalizeStreamLimit(options?.limit);
+    let cursor: string | undefined;
+    let yielded = 0;
+    for (;;) {
+      const page = await fetchPage({ ...options, pageSize: chunkSize, cursor });
+      const wills = Array.isArray(page) ? page : page.wills;
+      const nextCursor = Array.isArray(page) ? null : page.nextCursor;
+      for (const will of wills) {
+        if (limit !== undefined && yielded >= limit) {
+          return;
+        }
+        yielded += 1;
+        yield will;
+      }
+      if (nextCursor === null || nextCursor === undefined || wills.length === 0) {
+        return;
+      }
+      cursor = nextCursor;
+    }
   }
 
   /**

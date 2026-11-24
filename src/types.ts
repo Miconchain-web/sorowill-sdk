@@ -355,6 +355,29 @@ export interface PaginatedWillsResult {
   readonly nextCursor: string | null;
 }
 
+/**
+ * Options for the streaming list methods (`streamWillsByOwner`,
+ * `streamWillsByBeneficiary`, `streamWills`).
+ *
+ * Large result sets are fetched in pages and yielded one will at a time, so
+ * callers never have to hold the whole response in memory at once.
+ */
+export interface WillStreamOptions extends RequestOptions {
+  /**
+   * Number of wills fetched per RPC round-trip. Defaults to
+   * {@link DEFAULT_WILL_STREAM_CHUNK_SIZE}.
+   */
+  chunkSize?: number;
+  /**
+   * Maximum number of wills to yield before the stream ends. When omitted the
+   * stream yields every will the contract returns.
+   */
+  limit?: number;
+}
+
+/** Default page size used by the streaming list methods. */
+export const DEFAULT_WILL_STREAM_CHUNK_SIZE = 100;
+
 
 /**
  * A function that signs a transaction envelope (XDR) and resolves to the

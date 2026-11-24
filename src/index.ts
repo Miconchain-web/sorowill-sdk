@@ -107,6 +107,8 @@ export type {
   Will,
 } from './types';
 export { SOROBAN_EVENT_TYPES, WillStatus, WillErrorCode } from './types';
+export { DEFAULT_WILL_STREAM_CHUNK_SIZE } from './types';
+export type { WillStreamOptions } from './types';
 
 export {
   DEFAULT_FREIGHTER_CONNECT_TIMEOUT_MS,
